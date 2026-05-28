@@ -6,7 +6,8 @@ export interface VideoClip {
   color: string;
   uri?: string; // Optionnel pour le moment, servira pour les vraies vidéos
   duration?: number; // Durée en secondes, à définir lors de l'import réel
-  startAt: number;
+  startAt: number
+  type: 'video' | 'photo';
 }
 
 export interface TextBlock {

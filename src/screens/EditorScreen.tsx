@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, ScrollView, Dimensions, Alert, TextInput } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, ScrollView, Dimensions, Alert, TextInput, Image } from 'react-native';
 import Video from 'react-native-video';
+import { launchImageLibrary, ImagePickerResponse } from 'react-native-image-picker';
 import { VideoClip, TextBlock } from '../types/editor';
 
 const { width } = Dimensions.get('window');
@@ -21,15 +22,13 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
   const [isAddingText, setIsAddingText] = useState(false);
   const [customText, setCustomText] = useState('');
 
-  const [clips, setClips] = useState<VideoClip[]>(initialClips);
-  const [textBlocks, setTextBlocks] = useState<TextBlock[]>(initialTextBlocks);
+  const [clips, setClips] = useState<VideoClip[]>(initialClips.length > 0 ? initialClips : []);
+  const [textBlocks, setTextBlocks] = useState<TextBlock[]>(initialTextBlocks || []);
 
   const scrollViewRef = useRef<ScrollView>(null);
   const videoPlayerRef = useRef<any>(null);
   const isAutomaticScrolling = useRef(false);
-
-  // Trouver le clip vidéo qui correspond au flux actuel pour l'affichage initial
-  const mainVideoClip = clips.find(clip => clip.uri);
+  const isSeeking = useRef(false);
 
   const formatTime = (timeInSeconds: number) => {
     const minutes = Math.floor(timeInSeconds / 60);
@@ -38,51 +37,117 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
     return `${minutes < 10 ? `0${minutes}` : minutes}:${seconds < 10 ? `0${seconds}` : seconds}.${tenths}`;
   };
 
-  // Déterminer quel morceau de clip est actif à la seconde "time" de la timeline globale
+  // Récupère le clip actif à un instant T de la timeline globale
   const getActiveClipAndOffset = (time: number) => {
+    if (!clips || clips.length === 0) return null;
     let accumulatedTime = 0;
     for (const clip of clips) {
       const clipDuration = clip.width / PIXELS_PER_SECOND;
-      if (time >= accumulatedTime && time <= accumulatedTime + clipDuration) {
+      if (time >= accumulatedTime && time < accumulatedTime + clipDuration) {
         const timeInsideThisClip = time - accumulatedTime;
-        // Calcule la seconde exacte du fichier vidéo d'origine à lire
-        return { clip, realVideoTime: (clip.startAt || 0) + timeInsideThisClip };
+        return { clip, realVideoTime: (clip.startAt || 0) + timeInsideThisClip, accumulatedTime };
       }
       accumulatedTime += clipDuration;
+    }
+    // Sécurité pour la toute fin de la timeline
+    const lastClip = clips[clips.length - 1];
+    return { clip: lastClip, realVideoTime: (lastClip.startAt || 0) + (lastClip.width / PIXELS_PER_SECOND), accumulatedTime: accumulatedTime - (lastClip.width / PIXELS_PER_SECOND) };
+  };
+
+  const getTimelineTimeFromRealTime = (realTime: number) => {
+    if (!clips || clips.length === 0) return null;
+    let accumulatedTime = 0;
+    const activeData = getActiveClipAndOffset(currentTime);
+    
+    if (activeData && activeData.clip.type === 'video') {
+      const clipStart = activeData.clip.startAt || 0;
+      return activeData.accumulatedTime + (realTime - clipStart);
     }
     return null;
   };
 
-  // Synchroniser le lecteur vidéo natif lors des déplacements manuels (Pause + Scroll)
+  const getTotalDuration = () => {
+    let total = 0;
+    clips.forEach(clip => {
+      total += clip.width / PIXELS_PER_SECOND;
+    });
+    return total;
+  };
+
+  // Synchronisation du lecteur vidéo lors du scroll manuel
   useEffect(() => {
-    const activeData = getActiveClipAndOffset(currentTime);
-    if (activeData && videoPlayerRef.current && !isPlaying) {
-      videoPlayerRef.current.seek(activeData.realVideoTime);
+    if (!isPlaying && !isSeeking.current && clips.length > 0) {
+      const activeData = getActiveClipAndOffset(currentTime);
+      if (activeData && activeData.clip.type === 'video' && videoPlayerRef.current) {
+        videoPlayerRef.current.seek(activeData.realVideoTime);
+      }
     }
   }, [currentTime]);
 
-  // Gestion du défilement automatique et calage de la vidéo pendant la lecture
+  // Gestion de la progression pour les VIDÉOS
+  const handleVideoProgress = (data: { currentTime: number }) => {
+    if (!isPlaying || isSeeking.current) return;
+
+    const maxDuration = getTotalDuration();
+    const computedTimelineTime = getTimelineTimeFromRealTime(data.currentTime);
+
+    if (computedTimelineTime !== null) {
+      if (computedTimelineTime >= maxDuration - 0.05) {
+        setIsPlaying(false);
+        setCurrentTime(maxDuration);
+        return;
+      }
+      setCurrentTime(computedTimelineTime);
+      const targetScrollX = computedTimelineTime * PIXELS_PER_SECOND;
+      isAutomaticScrolling.current = true;
+      scrollViewRef.current?.scrollTo({ x: targetScrollX, animated: false });
+    }
+  };
+
+  // Horloge unique pour faire avancer la timeline (essentiel pour les PHOTOS et transitions)
   useEffect(() => {
-    let interval: any;
-    if (isPlaying) {
-      const startTime = Date.now() - currentTime * 1000;
+    let interval: any = null;
+    if (isPlaying && clips.length > 0) {
+      const frameRate = 100; // Mise à jour toutes les 100ms
+      const timeStep = frameRate / 1000;
+
       interval = setInterval(() => {
-        const elapsedSeconds = (Date.now() - startTime) / 1000;
-        setCurrentTime(elapsedSeconds);
-        
-        // Forcer la vidéo à suivre la découpe logique active
-        const activeData = getActiveClipAndOffset(elapsedSeconds);
-        if (activeData && videoPlayerRef.current) {
-          videoPlayerRef.current.seek(activeData.realVideoTime);
+        const maxDuration = getTotalDuration();
+        const nextTime = currentTime + timeStep;
+
+        if (nextTime >= maxDuration - 0.05) {
+          setIsPlaying(false);
+          setCurrentTime(maxDuration);
+          clearInterval(interval);
+          return;
         }
 
-        const targetScrollX = elapsedSeconds * PIXELS_PER_SECOND;
-        isAutomaticScrolling.current = true;
-        scrollViewRef.current?.scrollTo({ x: targetScrollX, animated: false });
-      }, 100);
+        const activeData = getActiveClipAndOffset(currentTime);
+        
+        // Si c'est une photo, c'est l'intervalle qui fait avancer le temps et le scroll
+        if (activeData && activeData.clip.type === 'photo') {
+          setCurrentTime(nextTime);
+          const targetScrollX = nextTime * PIXELS_PER_SECOND;
+          isAutomaticScrolling.current = true;
+          scrollViewRef.current?.scrollTo({ x: targetScrollX, animated: false });
+        } 
+        // Si on passe d'une photo à une vidéo, on force le lecteur vidéo à se caler au bon endroit
+        else if (activeData && activeData.clip.type === 'video') {
+          const nextActiveData = getActiveClipAndOffset(nextTime);
+          if (nextActiveData && videoPlayerRef.current) {
+            // Si le rendu vidéo prend du retard sur le timer, on l'aide à avancer
+            setCurrentTime(nextTime);
+            const targetScrollX = nextTime * PIXELS_PER_SECOND;
+            isAutomaticScrolling.current = true;
+            scrollViewRef.current?.scrollTo({ x: targetScrollX, animated: false });
+          }
+        }
+      }, frameRate);
+    } else {
+      if (interval) clearInterval(interval);
     }
-    return () => clearInterval(interval);
-  }, [isPlaying]);
+    return () => { if (interval) clearInterval(interval); };
+  }, [isPlaying, currentTime, clips]);
 
   const handleScroll = (event: any) => {
     if (isAutomaticScrolling.current) {
@@ -91,7 +156,47 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
     }
     const offsetX = event.nativeEvent.contentOffset.x;
     const newTime = Math.max(0, offsetX / PIXELS_PER_SECOND);
-    setCurrentTime(newTime);
+    const maxDuration = getTotalDuration();
+    setCurrentTime(Math.min(newTime, maxDuration));
+  };
+
+  const safeSyncData = async (updatedClips: VideoClip[], updatedTexts: TextBlock[]) => {
+    try {
+      await onTimelineChange(updatedClips, updatedTexts);
+    } catch (error) {
+      console.warn("Erreur de synchronisation :", error);
+    }
+  };
+
+  const handleAddMedia = () => {
+    launchImageLibrary({
+      mediaType: 'mixed',
+      quality: 1,
+    }, (response: ImagePickerResponse) => {
+      if (response.didCancel || !response.assets || response.assets.length === 0) return;
+
+      const asset = response.assets[0];
+      const isPhoto = asset.type?.startsWith('image/');
+      const duration = isPhoto ? 4 : (asset.duration || 10);
+      
+      const colors = ['#4A90E2', '#7ED321', '#F5A623', '#9013FE', '#E67E22'];
+      const randomColor = colors[Math.floor(Math.random() * colors.length)];
+
+      const newClip: VideoClip = {
+        id: `clip_${Date.now()}`,
+        name: asset.fileName || (isPhoto ? `Photo ${clips.length + 1}` : `Vidéo ${clips.length + 1}`),
+        uri: asset.uri || '',
+        width: duration * PIXELS_PER_SECOND,
+        duration: duration,
+        color: isPhoto ? '#2e86de' : randomColor,
+        type: isPhoto ? 'photo' : 'video',
+        startAt: 0,
+      };
+
+      const updatedClips = [...clips, newClip];
+      setClips(updatedClips);
+      safeSyncData(updatedClips, textBlocks);
+    });
   };
 
   const submitCustomText = () => {
@@ -107,12 +212,13 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
     };
     const updatedTexts = [...textBlocks, newText];
     setTextBlocks(updatedTexts);
-    onTimelineChange(clips, updatedTexts); // Synchro Supabase
+    safeSyncData(clips, updatedTexts); 
     setCustomText('');
     setIsAddingText(false);
   };
 
   const handleSplit = () => {
+    if (clips.length === 0) return;
     const currentPixelPosition = currentTime * PIXELS_PER_SECOND;
     let accumulatedWidth = 0;
     let clipToSplitIndex = -1;
@@ -133,8 +239,6 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
     const targetClip = clips[clipToSplitIndex];
     const widthBeforeTarget = accumulatedWidth - targetClip.width;
     const splitPointInClipPixels = currentPixelPosition - widthBeforeTarget;
-
-    // Durée en secondes du premier segment créé
     const timeCutInSeconds = splitPointInClipPixels / PIXELS_PER_SECOND;
 
     if (splitPointInClipPixels < 15 || (targetClip.width - splitPointInClipPixels) < 15) {
@@ -144,8 +248,7 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
 
     const updatedClips = [...clips];
     
-    // Segment A (conserve le même début dans la vraie vidéo mais réduit sa durée)
-    const clipA = {
+    const clipA: VideoClip = {
       ...targetClip,
       id: `${targetClip.id}_a_${Date.now()}`,
       name: `${targetClip.name} (P1)`,
@@ -153,27 +256,39 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
       duration: timeCutInSeconds,
     };
 
-    // Segment B (décale son point de départ réel là où le premier s'arrête)
-    const clipB = {
+    const clipB: VideoClip = {
       ...targetClip,
       id: `${targetClip.id}_b_${Date.now()}`,
       name: `${targetClip.name} (P2)`,
       width: targetClip.width - splitPointInClipPixels,
       duration: (targetClip.duration || (targetClip.width / PIXELS_PER_SECOND)) - timeCutInSeconds,
-      startAt: (targetClip.startAt || 0) + timeCutInSeconds, // Le secret de la découpe réelle
+      startAt: (targetClip.startAt || 0) + timeCutInSeconds,
     };
 
     updatedClips.splice(clipToSplitIndex, 1, clipA, clipB);
     setClips(updatedClips);
-    onTimelineChange(updatedClips, textBlocks); // Synchro Supabase
+    safeSyncData(updatedClips, textBlocks);
   };
 
   const handleDelete = () => {
-    if (!selectedClipId) return;
+    if (!selectedClipId || clips.length === 0) return;
+
     const updatedClips = clips.filter(clip => clip.id !== selectedClipId);
     setClips(updatedClips);
-    onTimelineChange(updatedClips, textBlocks); // Synchro Supabase
+    safeSyncData(updatedClips, textBlocks);
     setSelectedClipId(null);
+
+    let totalDuration = 0;
+    updatedClips.forEach(clip => {
+      totalDuration += clip.width / PIXELS_PER_SECOND;
+    });
+
+    if (currentTime > totalDuration) {
+      setCurrentTime(Math.max(0, totalDuration));
+      const targetScrollX = Math.max(0, totalDuration) * PIXELS_PER_SECOND;
+      isAutomaticScrolling.current = true;
+      scrollViewRef.current?.scrollTo({ x: targetScrollX, animated: true });
+    }
   };
 
   const activeTextBlock = textBlocks.find(
@@ -182,34 +297,69 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
 
   return (
     <View style={styles.container}>
-      {/* ZONE DU PLAYER VIDÉO */}
       <View style={styles.playerContainer}>
         <Text style={styles.timeCounter}>{formatTime(currentTime)}</Text>
         
         <View style={styles.videoScreen}>
-          {mainVideoClip?.uri ? (
-            <Video
-              ref={videoPlayerRef}
-              source={{ uri: mainVideoClip.uri }} 
-              style={styles.videoPlayer}
-              paused={!isPlaying}
-              resizeMode="contain"
-            />
-          ) : (
-            <Text style={styles.videoPlaceholderText}>Aucun flux vidéo détecté</Text>
-          )}
+          {(() => {
+            const activeData = getActiveClipAndOffset(currentTime);
+
+            if (!activeData || !activeData.clip.uri) {
+              return <Text style={styles.videoPlaceholderText}>Aucun média détecté</Text>;
+            }
+
+            if (activeData.clip.type === 'photo') {
+              return (
+                <Image 
+                  source={{ uri: activeData.clip.uri }} 
+                  style={styles.videoPlayer} 
+                  resizeMode="contain"
+                />
+              );
+            }
+
+            return (
+              <Video
+                ref={videoPlayerRef}
+                source={{ uri: activeData.clip.uri }} 
+                style={styles.videoPlayer}
+                paused={!isPlaying}
+                resizeMode="contain"
+                volume={1.0}
+                muted={false}
+                playInBackground={false}
+                onProgress={handleVideoProgress}
+                progressUpdateInterval={100}
+                onEnd={() => {
+                  // Si c'est le dernier clip vidéo, on arrête
+                  if (currentTime >= getTotalDuration() - 0.2) {
+                    setIsPlaying(false);
+                  }
+                }}
+              />
+            );
+          })()}
 
           {activeTextBlock && (
             <Text style={styles.overlayText}>{activeTextBlock.text}</Text>
           )}
         </View>
 
-        <TouchableOpacity style={[styles.playButton, isPlaying && styles.pauseButtonActive]} onPress={() => setIsPlaying(!isPlaying)}>
+        <TouchableOpacity 
+          style={[styles.playButton, isPlaying && styles.pauseButtonActive]} 
+          onPress={() => {
+            const maxDuration = getTotalDuration();
+            if (!isPlaying && currentTime >= maxDuration - 0.1) {
+              setCurrentTime(0);
+              scrollViewRef.current?.scrollTo({ x: 0, animated: true });
+            }
+            setIsPlaying(!isPlaying);
+          }}
+        >
           <Text style={styles.playButtonText}>{isPlaying ? '⏸️ PAUSE' : '▶ PLAY'}</Text>
         </TouchableOpacity>
       </View>
 
-      {/* OVERLAY D'AJOUT DE TEXTE */}
       {isAddingText && (
         <View style={styles.textInputOverlay}>
           <TextInput
@@ -231,7 +381,6 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
         </View>
       )}
 
-      {/* BARRE D'OUTILS */}
       <View style={styles.toolbar}>
         <TouchableOpacity style={styles.toolItem} onPress={handleSplit}>
           <Text style={styles.toolIcon}>✂️</Text>
@@ -245,13 +394,12 @@ export default function EditorScreen({ importedVideoName, initialClips, initialT
           <Text style={styles.toolIcon}>🗑️</Text>
           <Text style={[styles.toolText, selectedClipId && { color: '#ff4444' }]}>Supprimer</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.toolItem} onPress={onBackToImport}>
-          <Text style={styles.toolIcon}>🔄</Text>
-          <Text style={styles.toolText}>Changer</Text>
+        <TouchableOpacity style={styles.toolItem} onPress={() => handleAddMedia()}>
+          <Text style={styles.toolIcon}>➕</Text>
+          <Text style={[styles.toolText, { color: '#00bfff', fontWeight: 'bold' }]}>Ajouter</Text>
         </TouchableOpacity>
       </View>
 
-      {/* ZONE TIMELINE */}
       <View style={styles.timelineContainer}>
         <View style={styles.timeRuler}>
           <Text style={styles.timeText}>00:00</Text>

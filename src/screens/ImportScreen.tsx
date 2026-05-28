@@ -45,6 +45,37 @@ export default function ImportScreen({ onVideoSelected }: ImportScreenProps) {
     );
   };
 
+  const handlePickMedia = () => {
+  launchImageLibrary({
+    mediaType: 'mixed', // <-- Crucial : Permet de voir les vidéos ET les photos
+    quality: 1,
+  }, (response) => {
+    if (response.didCancel || !response.assets || response.assets.length === 0) return;
+
+    const asset = response.assets[0];
+    const isPhoto = asset.type?.startsWith('image/');
+    
+    // Si c'est une photo, on lui donne une durée par défaut de 4 secondes (4s * 20px = 80px de large)
+    // Si c'est une vidéo, on prend sa durée réelle (ou 10s par défaut si non détectée)
+    const duration = isPhoto ? 4 : (asset.duration || 10);
+    const PIXELS_PER_SECOND = 20;
+
+    const newClip = {
+      id: `clip_${Date.now()}`,
+      name: asset.fileName || (isPhoto ? 'Photo' : 'Vidéo'),
+      uri: asset.uri || '',
+      width: duration * PIXELS_PER_SECOND,
+      duration: duration,
+      color: isPhoto ? '#4A90E2' : '#7ED321', // Bleu pour les photos, Vert pour les vidéos
+      type: isPhoto ? 'photo' : 'video',
+      startAt: 0,
+    };
+
+    // Ici, au lieu de remplacer, tu ajoutes le nouveau clip au tableau des clips existants
+    // ex: setClips([...clips, newClip]);
+  });
+};
+
   const handleLogout = async () => {
     const { error } = await supabase.auth.signOut();
     if (error) Alert.alert("Erreur", error.message);
